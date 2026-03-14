@@ -9,7 +9,9 @@ Usage:
 """
 
 import argparse
+import base64
 import json
+import math
 import os
 import re
 from pathlib import Path
@@ -38,7 +40,7 @@ ALL_TASKS = [
     "QA_FINE_GRAINED_PLAN",
 ]
 
-# Global state: cache loaded task data to avoid re-reading on every navigation
+# Global state
 _cache: dict[str, list] = {}
 DATA_ROOT: str = ""
 
@@ -48,7 +50,6 @@ DATA_ROOT: str = ""
 # ──────────────────────────────────────────────────────────────────────────── #
 
 def load_task(task_name: str) -> list:
-    """Load and cache a task JSON. Returns list of entries."""
     if task_name in _cache:
         return _cache[task_name]
     json_path = os.path.join(DATA_ROOT, f"{task_name}.json")
@@ -61,113 +62,147 @@ def load_task(task_name: str) -> list:
 
 
 def get_image_paths(entry: dict) -> list[str]:
-    """Return list of absolute image file paths for an entry."""
     raw = entry.get("image", [])
     paths = [raw] if isinstance(raw, str) else list(raw)
-    abs_paths = []
-    for p in paths:
-        full = os.path.join(DATA_ROOT, "images", p)
-        if os.path.exists(full):
-            abs_paths.append(full)
-    return abs_paths
+    return [
+        os.path.join(DATA_ROOT, "images", p)
+        for p in paths
+        if os.path.exists(os.path.join(DATA_ROOT, "images", p))
+    ]
+
+
+def image_to_b64(path: str) -> str:
+    ext = Path(path).suffix.lower().lstrip(".")
+    mime = "image/jpeg" if ext in ("jpg", "jpeg") else f"image/{ext}"
+    with open(path, "rb") as f:
+        data = base64.b64encode(f.read()).decode()
+    return f"data:{mime};base64,{data}"
+
+
+def images_to_html(image_paths: list[str]) -> str:
+    """Render images as a scrollable CSS-grid HTML block."""
+    if not image_paths:
+        return "<p style='color:#aaa;padding:16px'>No images for this entry.</p>"
+
+    n = len(image_paths)
+    cols = 1 if n == 1 else (2 if n <= 4 else (3 if n <= 6 else 4))
+
+    # Per-image max-height: single image stays in viewport, multi-image is compact
+    if n == 1:
+        img_max_h = "560px"
+    elif n <= 4:
+        img_max_h = "380px"
+    else:
+        img_max_h = "280px"
+
+    cells = ""
+    for path in image_paths:
+        try:
+            src = image_to_b64(path)
+        except Exception:
+            src = ""
+        fname = Path(path).name
+        cells += (
+            f'<div style="background:#111;border-radius:6px;overflow:hidden;'
+            f'display:flex;align-items:center;justify-content:center">'
+            f'<img src="{src}" title="{fname}" '
+            f'style="max-width:100%;max-height:{img_max_h};'
+            f'height:auto;display:block;object-fit:contain"/>'
+            f"</div>"
+        )
+
+    return (
+        f'<div style="'
+        f"display:grid;"
+        f"grid-template-columns:repeat({cols},1fr);"
+        f"gap:8px;"
+        f"max-height:640px;"
+        f"overflow-y:auto;"
+        f"padding:8px;"
+        f"background:#1a1a2e;"
+        f'border-radius:8px">'
+        f"{cells}"
+        f"</div>"
+    )
 
 
 def format_conversation(entry: dict) -> str:
-    """Render the conversation as clean Markdown."""
     lines = []
-    convs = entry.get("conversations", [])
-    for turn in convs:
+    for turn in entry.get("conversations", []):
         speaker = turn.get("from", "")
-        text = turn.get("value", "")
-        # Strip <image> tokens
-        text = re.sub(r"<image>\n?", "", text).strip()
+        text = re.sub(r"<image>\n?", "", turn.get("value", "")).strip()
         if speaker == "human":
-            lines.append("### 🧑 Question\n")
-            lines.append(text)
+            lines.append("### 🧑 Question\n\n" + text)
         elif speaker == "gpt":
-            lines.append("\n---\n### ✅ Ground Truth Answer\n")
-            lines.append(f"**{text}**")
+            lines.append(f"\n---\n### ✅ Ground Truth Answer\n\n**{text}**")
     return "\n".join(lines)
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
-# Gradio event handlers
+# Event handlers
 # ──────────────────────────────────────────────────────────────────────────── #
 
+def _entry_outputs(data: list, idx: int, n: int):
+    entry = data[idx]
+    images = get_image_paths(entry)
+    html = images_to_html(images)
+    conv_md = format_conversation(entry)
+    entry_id = entry.get("id", "—")
+    info = f"**ID:** `{entry_id}`   |   **Images:** {len(images)}"
+    slider_label = gr.update(label=f"Entry ({idx + 1} / {n})")
+    return html, conv_md, info, slider_label
+
+
 def on_task_change(task_name: str):
-    """Called when the user selects a new task. Resets to entry 0."""
     data = load_task(task_name)
     n = len(data)
+    empty_html = "<p style='color:#aaa;padding:16px'>No data found.</p>"
     if n == 0:
         return (
             gr.update(value=0, minimum=0, maximum=0, step=1, label="Entry (0 / 0)"),
-            [],
-            "*No data found for this task.*",
-            "",
+            empty_html, "", "",
         )
-    entry = data[0]
-    images = get_image_paths(entry)
-    conv_md = format_conversation(entry)
-    entry_id = entry.get("id", "—")
-    return (
-        gr.update(value=0, minimum=0, maximum=n - 1, step=1, label=f"Entry (1 / {n})"),
-        images,
-        conv_md,
-        f"**ID:** `{entry_id}`   |   **Images:** {len(images)}",
-    )
+    slider_upd = gr.update(value=0, minimum=0, maximum=n - 1, step=1, label=f"Entry (1 / {n})")
+    html, conv_md, info, _ = _entry_outputs(data, 0, n)
+    return slider_upd, html, conv_md, info
 
 
 def on_index_change(task_name: str, idx: int):
-    """Called when the slider value changes."""
     data = load_task(task_name)
     n = len(data)
     if n == 0 or idx < 0 or idx >= n:
-        return [], "*No entry.*", "", gr.update(label="Entry")
-    entry = data[idx]
-    images = get_image_paths(entry)
-    conv_md = format_conversation(entry)
-    entry_id = entry.get("id", "—")
-    return (
-        images,
-        conv_md,
-        f"**ID:** `{entry_id}`   |   **Images:** {len(images)}",
-        gr.update(label=f"Entry ({idx + 1} / {n})"),
-    )
+        return "<p style='color:#aaa'>No entry.</p>", "", "", gr.update()
+    return _entry_outputs(data, int(idx), n)
 
 
 def on_prev(task_name: str, idx: int):
     data = load_task(task_name)
-    new_idx = max(0, idx - 1)
+    new_idx = max(0, int(idx) - 1)
     return (new_idx,) + on_index_change(task_name, new_idx)
 
 
 def on_next(task_name: str, idx: int):
     data = load_task(task_name)
-    new_idx = min(len(data) - 1, idx + 1)
+    new_idx = min(len(data) - 1, int(idx) + 1)
     return (new_idx,) + on_index_change(task_name, new_idx)
 
 
 def on_jump(task_name: str, jump_str: str):
-    """Jump to a specific entry ID or 1-based index."""
     data = load_task(task_name)
+    empty = "<p style='color:#aaa'>Not found.</p>"
     if not data:
-        return 0, [], "*No data.*", "", gr.update()
-
-    # Try matching by ID string first
+        return 0, empty, "", "", gr.update()
     jump_str = jump_str.strip()
     for i, entry in enumerate(data):
         if entry.get("id", "") == jump_str:
             return (i,) + on_index_change(task_name, i)
-
-    # Try 1-based numeric index
     try:
         num = int(jump_str)
         idx = max(0, min(len(data) - 1, num - 1))
         return (idx,) + on_index_change(task_name, idx)
     except ValueError:
         pass
-
-    return 0, [], f"*Entry `{jump_str}` not found.*", "", gr.update()
+    return 0, empty, f"*Entry `{jump_str}` not found.*", "", gr.update()
 
 
 # ──────────────────────────────────────────────────────────────────────────── #
@@ -183,95 +218,65 @@ def build_ui() -> gr.Blocks:
         )
 
         with gr.Row():
-            task_dd = gr.Dropdown(
-                choices=ALL_TASKS,
-                value=ALL_TASKS[0],
-                label="Task",
-                scale=3,
-            )
+            task_dd = gr.Dropdown(choices=ALL_TASKS, value=ALL_TASKS[0], label="Task", scale=3)
             jump_box = gr.Textbox(
-                placeholder="Jump to ID or index (e.g. QA_ACTION_UNDERSTANDING:42 or 42)",
-                label="Jump to entry",
-                scale=3,
+                placeholder="Jump to ID or 1-based index  (e.g. QA_ACTION_UNDERSTANDING:42 or 42)",
+                label="Jump to entry", scale=3,
             )
             jump_btn = gr.Button("Go", scale=1, variant="secondary")
 
         with gr.Row():
             prev_btn = gr.Button("◀  Prev", scale=1)
             idx_slider = gr.Slider(
-                minimum=0,
-                maximum=0,
-                step=1,
-                value=0,
-                label="Entry (– / –)",
-                scale=8,
-                interactive=True,
+                minimum=0, maximum=0, step=1, value=0,
+                label="Entry (– / –)", scale=8, interactive=True,
             )
             next_btn = gr.Button("Next  ▶", scale=1)
 
-        entry_info = gr.Markdown("", elem_id="entry-info")
+        entry_info = gr.Markdown("")
 
-        with gr.Row(equal_height=True):
-            gallery = gr.Gallery(
-                label="Images",
-                columns=3,
-                height=520,
-                object_fit="contain",
-                allow_preview=True,
-                type="filepath",
-                scale=3,
-            )
-            conv_panel = gr.Markdown(
-                label="Conversation",
-                value="",
-                elem_id="conv-panel",
-            )
+        # Images rendered as scrollable HTML grid
+        img_html = gr.HTML(label="Images")
+
+        conv_panel = gr.Markdown(label="Conversation", value="")
 
         # ── Event wiring ─────────────────────────────────────────────────── #
+        OUTPUTS = [img_html, conv_panel, entry_info, idx_slider]
 
-        # Task change → reset to entry 0
         task_dd.change(
             fn=on_task_change,
             inputs=[task_dd],
-            outputs=[idx_slider, gallery, conv_panel, entry_info],
+            outputs=[idx_slider, img_html, conv_panel, entry_info],
         )
-
-        # Slider drag / type
         idx_slider.release(
             fn=on_index_change,
             inputs=[task_dd, idx_slider],
-            outputs=[gallery, conv_panel, entry_info, idx_slider],
+            outputs=OUTPUTS,
         )
-
-        # Prev / Next buttons
         prev_btn.click(
             fn=on_prev,
             inputs=[task_dd, idx_slider],
-            outputs=[idx_slider, gallery, conv_panel, entry_info, idx_slider],
+            outputs=[idx_slider] + OUTPUTS,
         )
         next_btn.click(
             fn=on_next,
             inputs=[task_dd, idx_slider],
-            outputs=[idx_slider, gallery, conv_panel, entry_info, idx_slider],
+            outputs=[idx_slider] + OUTPUTS,
         )
-
-        # Jump
         jump_btn.click(
             fn=on_jump,
             inputs=[task_dd, jump_box],
-            outputs=[idx_slider, gallery, conv_panel, entry_info, idx_slider],
+            outputs=[idx_slider] + OUTPUTS,
         )
         jump_box.submit(
             fn=on_jump,
             inputs=[task_dd, jump_box],
-            outputs=[idx_slider, gallery, conv_panel, entry_info, idx_slider],
+            outputs=[idx_slider] + OUTPUTS,
         )
-
-        # Load initial task on startup
         demo.load(
             fn=on_task_change,
             inputs=[task_dd],
-            outputs=[idx_slider, gallery, conv_panel, entry_info],
+            outputs=[idx_slider, img_html, conv_panel, entry_info],
         )
 
     return demo
@@ -283,23 +288,11 @@ def build_ui() -> gr.Blocks:
 
 def parse_args():
     parser = argparse.ArgumentParser(description="ERIQ Benchmark Viewer")
-    parser.add_argument(
-        "--data_root",
-        type=str,
-        default="/home/unitree/remote_jensen2/ERIQ/",
-        help="Root directory of the ERIQ dataset",
-    )
-    parser.add_argument(
-        "--port",
-        type=int,
-        default=7860,
-        help="Port to serve the Gradio app on",
-    )
-    parser.add_argument(
-        "--share",
-        action="store_true",
-        help="Create a public Gradio share link",
-    )
+    parser.add_argument("--data_root", type=str,
+                        default="/home/unitree/remote_jensen2/ERIQ/",
+                        help="Root directory of the ERIQ dataset")
+    parser.add_argument("--port", type=int, default=7860)
+    parser.add_argument("--share", action="store_true")
     return parser.parse_args()
 
 
@@ -307,18 +300,12 @@ if __name__ == "__main__":
     args = parse_args()
     DATA_ROOT = args.data_root
 
-    # Verify data root exists
     if not os.path.isdir(DATA_ROOT):
         print(f"[ERROR] Data root not found: {DATA_ROOT}")
         raise SystemExit(1)
 
     print(f"Data root : {DATA_ROOT}")
     print(f"Port      : {args.port}")
-    print(f"Tasks     : {len(ALL_TASKS)}")
 
     demo = build_ui()
-    demo.launch(
-        server_name="0.0.0.0",
-        server_port=args.port,
-        share=args.share,
-    )
+    demo.launch(server_name="0.0.0.0", server_port=args.port, share=args.share)
